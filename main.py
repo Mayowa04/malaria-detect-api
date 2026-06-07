@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
 import joblib
 import numpy as np
@@ -11,14 +12,29 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# ── CORS: allow ALL origins explicitly ───────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,        # must be False when allow_origins=["*"]
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
+# Handle OPTIONS preflight manually as a safety net
+@app.options("/{rest_of_path:path}")
+async def preflight_handler(rest_of_path: str):
+    return JSONResponse(
+        content={},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        },
+    )
+
+# ── Load model ────────────────────────────────────────────────────────────────
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "model.pkl")
 bundle = None
 
@@ -31,7 +47,7 @@ def load_model():
     except Exception as e:
         print(f"❌ Model load failed: {e}")
 
-# ── Schemas ──────────────────────────────────────────────────────────────────
+# ── Schemas ───────────────────────────────────────────────────────────────────
 class PatientInput(BaseModel):
     age:            int = Field(..., ge=1, le=120)
     gender:         str = Field(..., description="Male or Female")
@@ -67,7 +83,7 @@ class PatientInput(BaseModel):
             "hypoglycaemia": 0, "prostration": 0, "hyperpyrexia": 0,
         }}
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def severity_label(p):
     if p >= 0.85: return "High Risk"
     if p >= 0.65: return "Moderate Risk"
@@ -89,14 +105,19 @@ def clinical_advice(positive, prob, count):
             "If symptoms persist beyond 48 hours, seek laboratory confirmation. "
             "Consider differentials: typhoid fever, UTI, or viral illness.")
 
-# ── Routes ───────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {
         "service": "MalariaDetect AI REST API",
         "status": "online",
         "model_loaded": bundle is not None,
-        "endpoints": {"predict": "POST /predict", "metrics": "GET /metrics", "docs": "GET /docs"}
+        "endpoints": {
+            "predict": "POST /predict",
+            "metrics": "GET /metrics",
+            "health":  "GET /health",
+            "docs":    "GET /docs",
+        }
     }
 
 @app.get("/health")
@@ -108,7 +129,7 @@ def health():
 @app.post("/predict")
 def predict(patient: PatientInput):
     if bundle is None:
-        raise HTTPException(503, "Model not ready. Try again shortly.")
+        raise HTTPException(503, "Model not ready. Try again in a moment.")
 
     gender_enc = 0 if patient.gender == "Female" else 1
     X_raw = np.array([[
@@ -120,19 +141,22 @@ def predict(patient: PatientInput):
         patient.hypoglycaemia, patient.prostration, patient.hyperpyrexia,
     ]], dtype=float)
 
-    X_s = bundle["scaler"].transform(X_raw)
+    X_s   = bundle["scaler"].transform(X_raw)
     rf_p  = float(bundle["rf"].predict_proba(X_s)[0, 1])
     xgb_p = float(bundle["xgb"].predict_proba(X_s)[0, 1])
     svm_p = float(bundle["svm"].predict_proba(X_s)[0, 1])
 
-    meta_in   = np.array([[rf_p, xgb_p, svm_p]])
-    final_p   = float(bundle["meta"].predict_proba(meta_in)[0, 1])
-    is_pos    = final_p >= 0.5
-    s_count   = sum([patient.fever, patient.cold, patient.rigor, patient.fatigue,
-                     patient.headache, patient.bitter_tongue, patient.vomiting,
-                     patient.diarrhea, patient.convulsion, patient.anaemia,
-                     patient.jaundice, patient.cocacola_urine,
-                     patient.hypoglycaemia, patient.prostration, patient.hyperpyrexia])
+    meta_in = np.array([[rf_p, xgb_p, svm_p]])
+    final_p = float(bundle["meta"].predict_proba(meta_in)[0, 1])
+    is_pos  = final_p >= 0.5
+
+    s_count = sum([
+        patient.fever, patient.cold, patient.rigor, patient.fatigue,
+        patient.headache, patient.bitter_tongue, patient.vomiting,
+        patient.diarrhea, patient.convulsion, patient.anaemia,
+        patient.jaundice, patient.cocacola_urine,
+        patient.hypoglycaemia, patient.prostration, patient.hyperpyrexia,
+    ])
 
     return {
         "prediction":       "Malaria Positive" if is_pos else "Malaria Negative",
@@ -141,9 +165,9 @@ def predict(patient: PatientInput):
         "confidence_pct":   round(final_p * 100, 2),
         "severity":         severity_label(final_p),
         "base_classifiers": {
-            "random_forest": {"probability": round(rf_p, 4),  "confidence_pct": round(rf_p*100, 2)},
-            "xgboost":       {"probability": round(xgb_p, 4), "confidence_pct": round(xgb_p*100, 2)},
-            "svm":           {"probability": round(svm_p, 4), "confidence_pct": round(svm_p*100, 2)},
+            "random_forest": {"probability": round(rf_p, 4),  "confidence_pct": round(rf_p  * 100, 2)},
+            "xgboost":       {"probability": round(xgb_p, 4), "confidence_pct": round(xgb_p * 100, 2)},
+            "svm":           {"probability": round(svm_p, 4), "confidence_pct": round(svm_p * 100, 2)},
         },
         "advice":         clinical_advice(is_pos, final_p, s_count),
         "symptoms_count": s_count,
@@ -156,11 +180,20 @@ def get_metrics():
         raise HTTPException(503, "Model not loaded")
     m = bundle["metrics"]
     return {
-        "ensemble":  {"accuracy": m["accuracy"], "precision": m["precision"],
-                      "recall": m["recall"], "f1": m["f1"], "auc": m["auc"]},
-        "individual": bundle["individual"],
-        "dataset":   {"total": 557, "positive": 343, "negative": 214,
-                      "sources": ["Federal Polytechnic Ilaro, Ogun State",
-                                  "PHC Centres, Osogbo, Osun State"]},
+        "ensemble":  {
+            "accuracy":  m["accuracy"],
+            "precision": m["precision"],
+            "recall":    m["recall"],
+            "f1":        m["f1"],
+            "auc":       m["auc"],
+        },
+        "individual":  bundle["individual"],
+        "dataset": {
+            "total": 557, "positive": 343, "negative": 214,
+            "sources": [
+                "Federal Polytechnic Ilaro Medical Centre, Ogun State",
+                "PHC Centres, Osogbo, Osun State",
+            ],
+        },
         "confusion_matrix": m["confusion_matrix"],
     }
