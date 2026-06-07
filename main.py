@@ -1,56 +1,148 @@
-from fastapi import FastAPI, HTTPException, Request
+import os, io, base64, warnings
+warnings.filterwarnings('ignore')
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
-import joblib
 import numpy as np
-import os
 
 app = FastAPI(
     title="MalariaDetect AI – API",
-    description="Ensemble-based malaria detection for South West Nigeria. RF + XGBoost + SVM → LR meta-learner.",
+    description="Ensemble malaria detection for South West Nigeria. RF + XGBoost + SVM → LR meta-learner.",
     version="1.0.0",
 )
 
-# ── CORS: allow ALL origins explicitly ───────────────────────────────────────
+# ── CORS ─────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,        # must be False when allow_origins=["*"]
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_credentials=False,
+    allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
 )
 
-# Handle OPTIONS preflight manually as a safety net
 @app.options("/{rest_of_path:path}")
-async def preflight_handler(rest_of_path: str):
-    return JSONResponse(
-        content={},
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-        },
-    )
+async def preflight(rest_of_path: str):
+    return JSONResponse({}, headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+    })
 
-# ── Load model ────────────────────────────────────────────────────────────────
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "model.pkl")
+# ── Model bundle ──────────────────────────────────────────────────────────────
 bundle = None
+
+def train_model():
+    """Train the ensemble from the embedded dataset."""
+    import joblib
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.svm import SVC
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import MinMaxScaler
+    from sklearn.metrics import (accuracy_score, precision_score,
+                                 recall_score, f1_score,
+                                 roc_auc_score, confusion_matrix)
+    from imblearn.over_sampling import SMOTE
+    import xgboost as xgb
+    from dataset_embed import DATA
+
+    print("Training ensemble model from embedded dataset...")
+    arr = np.array(DATA, dtype=float)
+    X, y = arr[:, :17], arr[:, 17].astype(int)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.15, random_state=42, stratify=y)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train, y_train, test_size=0.176, random_state=42, stratify=y_train)
+
+    smote = SMOTE(random_state=42)
+    X_tr, y_tr = smote.fit_resample(X_train, y_train)
+
+    scaler = MinMaxScaler()
+    X_tr  = scaler.fit_transform(X_tr)
+    X_vs  = scaler.transform(X_val)
+    X_ts  = scaler.transform(X_test)
+
+    rf  = RandomForestClassifier(n_estimators=300, random_state=42, n_jobs=-1)
+    xgb_clf = xgb.XGBClassifier(n_estimators=200, learning_rate=0.05,
+                                  random_state=42, eval_metric='logloss')
+    svm = SVC(kernel='rbf', probability=True, random_state=42, C=10)
+
+    rf.fit(X_tr, y_tr)
+    xgb_clf.fit(X_tr, y_tr)
+    svm.fit(X_tr, y_tr)
+
+    meta_X_val = np.column_stack([
+        rf.predict_proba(X_vs)[:,1],
+        xgb_clf.predict_proba(X_vs)[:,1],
+        svm.predict_proba(X_vs)[:,1],
+    ])
+    meta_lr = LogisticRegression()
+    meta_lr.fit(meta_X_val, y_val)
+
+    meta_X_test = np.column_stack([
+        rf.predict_proba(X_ts)[:,1],
+        xgb_clf.predict_proba(X_ts)[:,1],
+        svm.predict_proba(X_ts)[:,1],
+    ])
+    y_pred = meta_lr.predict(meta_X_test)
+    y_prob = meta_lr.predict_proba(meta_X_test)[:,1]
+
+    metrics = {
+        'accuracy':  round(accuracy_score(y_test, y_pred)*100, 2),
+        'precision': round(precision_score(y_test, y_pred)*100, 2),
+        'recall':    round(recall_score(y_test, y_pred)*100, 2),
+        'f1':        round(f1_score(y_test, y_pred)*100, 2),
+        'auc':       round(roc_auc_score(y_test, y_prob)*100, 2),
+        'confusion_matrix': confusion_matrix(y_test, y_pred).tolist(),
+    }
+
+    individual = {}
+    for name, m in [('rf', rf), ('xgb', xgb_clf), ('svm', svm)]:
+        yp  = m.predict(X_ts)
+        ypr = m.predict_proba(X_ts)[:,1]
+        individual[name] = {
+            'accuracy': round(accuracy_score(y_test, yp)*100, 2),
+            'f1':       round(f1_score(y_test, yp)*100, 2),
+            'auc':      round(roc_auc_score(y_test, ypr)*100, 2),
+        }
+
+    b = dict(rf=rf, xgb=xgb_clf, svm=svm, meta=meta_lr,
+             scaler=scaler, metrics=metrics, individual=individual)
+
+    # Save so subsequent restarts skip retraining
+    try:
+        joblib.dump(b, 'model.pkl')
+        print("model.pkl saved.")
+    except Exception as e:
+        print(f"Could not save model.pkl: {e}")
+
+    print(f"Training complete. Accuracy={metrics['accuracy']}%")
+    return b
+
 
 @app.on_event("startup")
 def load_model():
     global bundle
-    try:
-        bundle = joblib.load(MODEL_PATH)
-        print("✅ Ensemble model loaded.")
-    except Exception as e:
-        print(f"❌ Model load failed: {e}")
+    import joblib
+    model_path = os.path.join(os.path.dirname(__file__), "model.pkl")
+    if os.path.exists(model_path):
+        try:
+            bundle = joblib.load(model_path)
+            print("✅ Loaded model.pkl from disk.")
+            return
+        except Exception as e:
+            print(f"model.pkl load failed ({e}), retraining...")
+    bundle = train_model()
+    print("✅ Model ready.")
 
-# ── Schemas ───────────────────────────────────────────────────────────────────
+
+# ── Schema ────────────────────────────────────────────────────────────────────
 class PatientInput(BaseModel):
     age:            int = Field(..., ge=1, le=120)
-    gender:         str = Field(..., description="Male or Female")
+    gender:         str
     fever:          int = Field(..., ge=0, le=1)
     cold:           int = Field(..., ge=0, le=1)
     rigor:          int = Field(..., ge=0, le=1)
@@ -75,13 +167,14 @@ class PatientInput(BaseModel):
         return v
 
     class Config:
-        schema_extra = {"example": {
+        json_schema_extra = {"example": {
             "age": 35, "gender": "Female",
             "fever": 1, "cold": 1, "rigor": 1, "fatigue": 1, "headache": 1,
             "bitter_tongue": 0, "vomiting": 1, "diarrhea": 0, "convulsion": 0,
             "anaemia": 0, "jaundice": 0, "cocacola_urine": 0,
             "hypoglycaemia": 0, "prostration": 0, "hyperpyrexia": 0,
         }}
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def severity_label(p):
@@ -95,41 +188,43 @@ def clinical_advice(positive, prob, count):
     pct = round(prob * 100, 1)
     if positive:
         if prob >= 0.85:
-            return (f"HIGH RISK ({pct}%): Strong clinical indication of malaria from {count} symptom(s). "
-                    "Immediate RDT or blood smear microscopy confirmation is urgently required. "
-                    "Initiate antimalarial treatment per NMEP guidelines upon confirmation.")
+            return (f"HIGH RISK ({pct}%): Strong clinical indication of malaria from "
+                    f"{count} symptom(s). Immediate RDT or blood smear microscopy "
+                    "confirmation is urgently required. Initiate antimalarial treatment "
+                    "per NMEP guidelines upon confirmation.")
         return (f"MODERATE RISK ({pct}%): Clinical profile suggests possible malaria. "
-                "Laboratory confirmation via RDT or microscopy is recommended before treatment. "
-                "Monitor closely and reassess if symptoms worsen.")
+                "Laboratory confirmation via RDT or microscopy is recommended before "
+                "treatment. Monitor closely and reassess if symptoms worsen.")
     return (f"LOW RISK ({pct}%): Profile does not strongly indicate malaria. "
             "If symptoms persist beyond 48 hours, seek laboratory confirmation. "
             "Consider differentials: typhoid fever, UTI, or viral illness.")
+
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {
         "service": "MalariaDetect AI REST API",
-        "status": "online",
+        "status":  "online",
         "model_loaded": bundle is not None,
         "endpoints": {
             "predict": "POST /predict",
-            "metrics": "GET /metrics",
-            "health":  "GET /health",
-            "docs":    "GET /docs",
+            "metrics": "GET  /metrics",
+            "health":  "GET  /health",
+            "docs":    "GET  /docs",
         }
     }
 
 @app.get("/health")
 def health():
     if bundle is None:
-        raise HTTPException(503, "Model not loaded")
+        raise HTTPException(503, "Model not loaded yet — still training, retry in 60s")
     return {"status": "healthy", "model": "loaded"}
 
 @app.post("/predict")
 def predict(patient: PatientInput):
     if bundle is None:
-        raise HTTPException(503, "Model not ready. Try again in a moment.")
+        raise HTTPException(503, "Model not ready — still training, retry in 60s")
 
     gender_enc = 0 if patient.gender == "Female" else 1
     X_raw = np.array([[
@@ -165,7 +260,7 @@ def predict(patient: PatientInput):
         "confidence_pct":   round(final_p * 100, 2),
         "severity":         severity_label(final_p),
         "base_classifiers": {
-            "random_forest": {"probability": round(rf_p, 4),  "confidence_pct": round(rf_p  * 100, 2)},
+            "random_forest": {"probability": round(rf_p,  4), "confidence_pct": round(rf_p  * 100, 2)},
             "xgboost":       {"probability": round(xgb_p, 4), "confidence_pct": round(xgb_p * 100, 2)},
             "svm":           {"probability": round(svm_p, 4), "confidence_pct": round(svm_p * 100, 2)},
         },
@@ -180,7 +275,7 @@ def get_metrics():
         raise HTTPException(503, "Model not loaded")
     m = bundle["metrics"]
     return {
-        "ensemble":  {
+        "ensemble": {
             "accuracy":  m["accuracy"],
             "precision": m["precision"],
             "recall":    m["recall"],
